@@ -1,5 +1,7 @@
 # fila
 
+[![test](https://github.com/Salv4d/fila/actions/workflows/test.yml/badge.svg)](https://github.com/Salv4d/fila/actions/workflows/test.yml)
+
 **A pocket Kafka for Claude Code.**
 
 Rails-style migrations for your pending work: scripts run once and their ids go into an
