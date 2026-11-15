@@ -16,7 +16,10 @@ Usage:
   fila undo ID [ID ...]             put back in the queue
   fila log ID                       show the output of the last run
   fila hook                         SessionStart hook output (silent when nothing is pending)
-  fila install-hook [--global]      add the hook to .claude/settings.json (or ~/.claude/settings.json)
+  fila install-hook [--global]      add the hook to .claude/settings.json; --global puts it in
+                                    ~/.claude/settings.json and registers this project, so the hook
+                                    reports it from any folder you open Claude Code in
+  fila projects [--remove PATH]     list (or unregister) the registered projects
 
 Only the Python 3 standard library. MIT license.
 """
@@ -337,6 +340,26 @@ def cmd_log(a):
     sys.stdout.write(log.read_text(encoding="utf-8", errors="replace"))
 
 
+def registry() -> Path:
+    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "fila" / "projects"
+
+
+def registered() -> list[Path]:
+    f = registry()
+    if not f.exists():
+        return []
+    return [Path(l) for l in f.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def register(root: Path):
+    f = registry()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    roots = [str(r) for r in registered()]
+    if str(root) not in roots:
+        f.write_text("".join(r + "\n" for r in roots + [str(root)]), encoding="utf-8")
+
+
 def hook_text(root: Path) -> str | None:
     pend = pending(root)
     if not pend:
@@ -350,25 +373,48 @@ def hook_text(root: Path) -> str | None:
         lines.append("Scripts: run `fila run` (long jobs: in the background) and report the result.")
     if s < len(pend):
         lines.append("Tasks (.md): read the file, do what it says, then `fila done <id>`.")
-    lines.append("Mention this queue to the user at the start of the session before starting new work.")
+    lines.append(f"Run fila commands from {root} (or set FILA_ROOT={root}).")
     return "\n".join(lines)
 
 
 def cmd_hook(a):
-    root = find_root()
-    if root is None:
+    roots, vistos = [], set()
+    for r in [find_root(), *registered()]:
+        if r is not None and (r / DIR).is_dir() and str(r.resolve()) not in vistos:
+            vistos.add(str(r.resolve())); roots.append(r.resolve())
+    blocos = [(r, hook_text(r)) for r in roots]
+    blocos = [(r, t) for r, t in blocos if t]
+    if not blocos:
         return 0
-    txt = hook_text(root)
-    if txt is None:
-        return 0
-    n = len(pending(root))
-    print(json.dumps({"systemMessage": f"fila: {n} pending · `fila status`",
+    n = sum(len(pending(r)) for r, _ in blocos)
+    onde = ", ".join(r.name for r, _ in blocos)
+    txt = "\n\n".join(t for _, t in blocos)
+    txt += "\nMention this queue to the user at the start of the session before starting new work."
+    print(json.dumps({"systemMessage": f"fila: {n} pending ({onde}) · `fila status`",
                       "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": txt}},
                      ensure_ascii=False))
     return 0
 
 
+def cmd_projects(a):
+    if a.remove:
+        alvo = str(Path(a.remove).resolve())
+        rest = [str(r) for r in registered() if str(r) != alvo]
+        registry().write_text("".join(r + "\n" for r in rest), encoding="utf-8")
+        print(f"unregistered {alvo}")
+        return 0
+    for r in registered():
+        ok = (r / DIR).is_dir()
+        n = len(pending(r)) if ok else 0
+        estado = (c(YELLOW, f"{n} pending") if n else c(GREEN, "all done")) if ok else c(RED, "missing .fila/")
+        print(f"  {r}  {estado}")
+    return 0
+
+
 def cmd_install_hook(a):
+    if a.glob and find_root():
+        register(find_root())
+        print(f"registered {find_root()} in {registry()}")
     target = (Path.home() if a.glob else (find_root() or Path.cwd())) / ".claude" / "settings.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     cfg = json.loads(target.read_text(encoding="utf-8")) if target.exists() and target.read_text().strip() else {}
@@ -403,6 +449,7 @@ def main(argv=None):
     sub.add_parser("hook").set_defaults(f=cmd_hook)
     p = sub.add_parser("install-hook"); p.add_argument("--global", dest="glob", action="store_true")
     p.set_defaults(f=cmd_install_hook)
+    p = sub.add_parser("projects"); p.add_argument("--remove"); p.set_defaults(f=cmd_projects)
     a = ap.parse_args(argv)
     if not getattr(a, "f", None):
         a = ap.parse_args(["status"]) if find_root() else ap.parse_args(["--help"])
