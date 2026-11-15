@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Launcher: finds a Python 3.8+ (python3, python or the Windows "py" launcher) and runs fila.
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+for py in python3 python "py -3"; do
+  if $py -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" >/dev/null 2>&1; then
+    exec $py "$DIR/fila" "$@"
+  fi
+done
+echo "fila: Python 3.8+ not found (tried python3, python, py -3)" >&2
+exit 0

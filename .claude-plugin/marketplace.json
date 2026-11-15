@@ -1,0 +1,15 @@
+{
+  "name": "fila",
+  "description": "fila: a pocket Kafka for Claude Code. Rails-style migrations for pending work.",
+  "owner": {
+    "name": "Salvador Oliveira",
+    "url": "https://github.com/Salv4d"
+  },
+  "plugins": [
+    {
+      "name": "fila",
+      "source": "./",
+      "description": "A pocket Kafka for Claude Code: Rails-style migrations for pending work, shown when a session starts."
+    }
+  ]
+}

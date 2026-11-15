@@ -36,7 +36,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DIR = ".fila"
 ID_RE = re.compile(r"^(\d{14})_([\w.-]+?)\.(\w+)$")
 TASK_EXTS = {"md", "txt"}
@@ -56,6 +56,8 @@ GREEN, YELLOW, RED, DIM, BOLD, CYAN = "32", "33", "31", "2", "1", "36"
 def find_root(start: Path | None = None) -> Path | None:
     if os.environ.get("FILA_ROOT"):
         return Path(os.environ["FILA_ROOT"]).resolve()
+    if start is None and os.environ.get("CLAUDE_PROJECT_DIR"):
+        start = Path(os.environ["CLAUDE_PROJECT_DIR"])   # set by Claude Code for hooks and plugins
     p = (start or Path.cwd()).resolve()
     for d in (p, *p.parents):
         if (d / DIR).is_dir():
@@ -242,8 +244,24 @@ def cmd_status(a):
 
 
 def _alive(pid: int) -> bool:
+    """Is the process holding the lock still running? Never sends a signal on Windows:
+    there, os.kill(pid, 0) terminates the process instead of probing it."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, pid)        # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+        k32.CloseHandle(h)
+        return bool(ok) and code.value == 259           # STILL_ACTIVE
     try:
         os.kill(pid, 0)
+        return True
+    except PermissionError:
         return True
     except (OSError, ValueError):
         return False
@@ -251,7 +269,10 @@ def _alive(pid: int) -> bool:
 
 def _runner(m: Migration) -> list[str]:
     if m.ext == "sh":
-        return ["bash", str(m.path)]
+        bash = shutil.which("bash")
+        if not bash:
+            sys.exit(f"{m.path.name}: .sh needs bash (on Windows, install Git for Windows) or use a .py migration")
+        return [bash, str(m.path)]
     if m.ext == "py":
         return [sys.executable, str(m.path)]
     if os.access(m.path, os.X_OK):
@@ -433,6 +454,11 @@ def cmd_install_hook(a):
 
 
 def main(argv=None):
+    for stream in (sys.stdout, sys.stderr):              # Windows consoles default to cp1252
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser(prog="fila", description="Rails-style migration queue for pending work.",
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version=f"fila {VERSION}")

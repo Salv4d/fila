@@ -1,6 +1,9 @@
 # fila
 
-**Rails-style migrations for your pending work, checked every time Claude Code starts.**
+**A pocket Kafka for Claude Code.**
+
+Rails-style migrations for your pending work: scripts run once and their ids go into an
+append-only log, tasks wait for the agent, and the queue shows up every time a session starts.
 
 🇧🇷 [Leia em português](README.pt-BR.md)
 
@@ -19,6 +22,11 @@ forget. Next time you open Claude Code, nobody knows what was left half done.
 - A **SessionStart hook** tells Claude Code what is still pending as soon as a session opens, so
   the agent picks up where you left off.
 
+Why "pocket Kafka": a Kafka consumer never asks "did I process this?", it reads its committed
+offset. `fila` does the same with `.fila/done`, an append-only log of executed ids, which is also
+exactly what Rails' `schema_migrations` is. No broker, no partitions, no cluster: one file and a
+text log, sized for one person and one agent.
+
 One file, Python 3 standard library only, no daemon, no database. The queue is plain text you can
 commit, diff and review.
 
@@ -34,12 +42,43 @@ and Claude Code sees it at the start of the next session.
 
 ## Install
 
+### As a Claude Code plugin (recommended)
+
+Inside Claude Code (2.1.275 or later):
+
+```
+/plugin install fila --marketplace Salv4d/fila
+```
+
+On older versions, two steps: `/plugin marketplace add Salv4d/fila`, then `/plugin install fila@fila`.
+
+That gives you the SessionStart hook, the `fila` command on the agent's PATH, and three slash commands:
+
+| Command | What it does |
+|---|---|
+| `/fila:status` | Shows the queue and suggests the next step |
+| `/fila:new <what>` | Queues new work: Claude decides script or task and writes the file |
+| `/fila:run` | Runs the pending scripts (in the background when they are long) and reports |
+
+It works in the terminal, the desktop app and the VS Code extension, because they share the same
+settings on a computer. It does not work in claude.ai chat or cloud sessions: there is no local
+folder there.
+
+### As a standalone CLI
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Salv4d/fila/main/fila -o ~/.local/bin/fila
 chmod +x ~/.local/bin/fila
+fila install-hook --global   # inside a project: hook in ~/.claude/settings.json + project registered
 ```
 
-Or clone the repo and put `fila` anywhere on your `PATH`.
+Use one of the two, not both, or the hook runs twice.
+
+### Windows
+
+Works with Python 3.8+ (`python`, `python3` or the `py` launcher) and Git for Windows, which is
+also what Claude Code uses to run hooks. `.py` migrations run anywhere; `.sh` migrations need
+bash (Git Bash). CI runs the tests on Linux, macOS and Windows.
 
 ## Quick start
 
@@ -127,6 +166,18 @@ Commit `.fila/migrations/` and `.fila/done`: that is your history of what was do
   even if you call `fila` from a subfolder. Scripts get `FILA_ID` and `FILA_ROOT` in the environment.
 - **Concurrency**: a lock file stops two `fila run` at once.
 - **Format of `.fila/done`**: one line per id, `id<TAB>ran|marked<TAB>iso-date<TAB>duration`.
+
+## Similar projects, and how fila differs
+
+| Project | What it is | Difference |
+|---|---|---|
+| [Beads](https://github.com/steveyegge/beads) | Git-backed issue tracker that gives coding agents memory across sessions | Tracks issues (status, priority, dependencies); does not execute anything. `fila` runs scripts once and logs them |
+| [Backlog.md](https://github.com/MrLesk/Backlog.md) | Markdown task board for humans and AI agents | A board, not an ordered queue with run-once semantics |
+| [Taskmaster AI](https://github.com/eyaltoledano/claude-task-master) | Breaks a PRD into tasks for the agent | Planning; `fila` is about work already decided that still has to happen |
+| [scriptup](https://github.com/mg98/scriptup), [TerraRatchet](https://github.com/triptease/terra-ratchet) | Run-once script runners, migration style | Same core idea for scripts, but not agent-aware: no tasks, no session hook |
+
+If you need a full issue tracker for your agent, use Beads. If you need "this has to happen, once,
+in this order, and the agent must not forget it", that is `fila`.
 
 ## Tests
 
