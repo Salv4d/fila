@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""fila: a Rails-style migration queue for pending work, checked every time Claude Code starts.
+
+A "migration" is a file in .fila/migrations/ named <timestamp>_<name>.<ext>:
+  - a script (.sh, .py, or any executable) that `fila run` executes, in id order;
+  - a task (.md) with instructions for a person or an AI agent, closed with `fila done <id>`.
+Running (or marking) a migration appends its id to .fila/done, like Rails' schema_migrations.
+Pending = every migration whose id is not in .fila/done.
+
+Usage:
+  fila init                         create .fila/ in the current directory
+  fila new <name> [--md]            new migration (script by default, --md for a task)
+  fila status [--json]              pending and done
+  fila run [ID ...] [--dry-run]     run pending scripts in order; stops at the first failure
+  fila done ID [ID ...]             mark as done without running (tasks, or work done by hand)
+  fila undo ID [ID ...]             put back in the queue
+  fila log ID                       show the output of the last run
+  fila hook                         SessionStart hook output (silent when nothing is pending)
+  fila install-hook [--global]      add the hook to .claude/settings.json (or ~/.claude/settings.json)
+
+Only the Python 3 standard library. MIT license.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+VERSION = "0.1.0"
+DIR = ".fila"
+ID_RE = re.compile(r"^(\d{14})_([\w.-]+?)\.(\w+)$")
+TASK_EXTS = {"md", "txt"}
+
+USE_COLOR = sys.stdout.isatty() or os.environ.get("FORCE_COLOR")
+
+
+def c(code: str, s: str) -> str:
+    return f"\033[{code}m{s}\033[0m" if USE_COLOR else s
+
+
+GREEN, YELLOW, RED, DIM, BOLD, CYAN = "32", "33", "31", "2", "1", "36"
+
+
+# ------------------------------------------------------------------ model
+
+def find_root(start: Path | None = None) -> Path | None:
+    if os.environ.get("FILA_ROOT"):
+        return Path(os.environ["FILA_ROOT"]).resolve()
+    p = (start or Path.cwd()).resolve()
+    for d in (p, *p.parents):
+        if (d / DIR).is_dir():
+            return d
+    return None
+
+
+def need_root() -> Path:
+    r = find_root()
+    if r is None:
+        sys.exit(f"no {DIR}/ here or in any parent directory. Run `fila init` first.")
+    return r
+
+
+class Migration:
+    def __init__(self, path: Path):
+        m = ID_RE.match(path.name)
+        self.path, self.id, self.name, self.ext = path, m[1], m[2], m[3].lower()
+
+    @property
+    def is_task(self) -> bool:
+        return self.ext in TASK_EXTS
+
+    @property
+    def kind(self) -> str:
+        return "task" if self.is_task else "script"
+
+    def description(self) -> str:
+        """First comment line of a script, or first heading/line of a task."""
+        try:
+            lines = self.path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return ""
+        for ln in lines:
+            s = ln.strip()
+            if not s or s.startswith("#!"):
+                continue
+            if self.is_task:
+                return s.lstrip("# ").strip()
+            if s.startswith(("#", "//", "--")):
+                d = s.lstrip("#/- ").strip()
+                if d:
+                    return d
+                continue
+            break
+        return ""
+
+
+def migrations(root: Path) -> list[Migration]:
+    d = root / DIR / "migrations"
+    if not d.is_dir():
+        return []
+    return sorted((Migration(p) for p in d.iterdir() if p.is_file() and ID_RE.match(p.name)), key=lambda m: m.id)
+
+
+def read_done(root: Path) -> dict[str, dict]:
+    f = root / DIR / "done"
+    out = {}
+    if f.exists():
+        for ln in f.read_text(encoding="utf-8").splitlines():
+            parts = ln.split("\t")
+            if parts and re.fullmatch(r"\d{14}", parts[0]):
+                out[parts[0]] = {"how": parts[1] if len(parts) > 1 else "", "at": parts[2] if len(parts) > 2 else "",
+                                 "took": parts[3] if len(parts) > 3 else ""}
+    return out
+
+
+def write_done(root: Path, mid: str, how: str, took: str = ""):
+    f = root / DIR / "done"
+    now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    with f.open("a", encoding="utf-8") as fh:
+        fh.write(f"{mid}\t{how}\t{now}\t{took}\n")
+
+
+def remove_done(root: Path, ids: set[str]):
+    f = root / DIR / "done"
+    if not f.exists():
+        return
+    keep = [ln for ln in f.read_text(encoding="utf-8").splitlines() if ln.split("\t")[0] not in ids]
+    f.write_text("".join(ln + "\n" for ln in keep), encoding="utf-8")
+
+
+def pending(root: Path) -> list[Migration]:
+    done = read_done(root)
+    return [m for m in migrations(root) if m.id not in done]
+
+
+def resolve(root: Path, ref: str) -> Migration:
+    hits = [m for m in migrations(root) if m.id == ref or m.id.startswith(ref) or m.path.name == ref or m.name == ref]
+    if len(hits) != 1:
+        sys.exit(f"{'no' if not hits else 'ambiguous'} migration matching {ref!r}")
+    return hits[0]
+
+
+# ------------------------------------------------------------------ commands
+
+TEMPLATE_SH = """#!/usr/bin/env bash
+# {desc}
+#
+# Runs from the project root ({root_hint}). Exit code 0 = done (fila records the id).
+# Anything else stops the queue here; fix it and run `fila run` again.
+# Env: FILA_ID, FILA_ROOT.
+set -euo pipefail
+
+echo "TODO: {desc}"
+exit 1
+"""
+
+TEMPLATE_MD = """# {desc}
+
+What needs to be done, for a person or an AI agent. Be specific: files, commands, what "done" means.
+
+When it is done: `fila done {mid}`
+"""
+
+
+def cmd_init(a):
+    root = Path.cwd()
+    (root / DIR / "migrations").mkdir(parents=True, exist_ok=True)
+    (root / DIR / "logs").mkdir(exist_ok=True)
+    (root / DIR / "done").touch()
+    gi = root / DIR / ".gitignore"
+    if not gi.exists():
+        gi.write_text("logs/\nrun.lock\n", encoding="utf-8")
+    print(f"created {root / DIR}/  (commit migrations/ and done; logs stay local)")
+    print("next: `fila new <name>` and `fila install-hook`")
+
+
+def cmd_new(a):
+    root = need_root()
+    slug = re.sub(r"[^\w.-]+", "_", a.name.strip().lower()).strip("_") or "task"
+    mid = dt.datetime.now().strftime("%Y%m%d%H%M%S")
+    while any(m.id == mid for m in migrations(root)):
+        mid = str(int(mid) + 1)
+    ext = "md" if a.md else a.ext
+    p = root / DIR / "migrations" / f"{mid}_{slug}.{ext}"
+    desc = a.description or a.name.strip()
+    tpl = TEMPLATE_MD if ext in TASK_EXTS else TEMPLATE_SH
+    p.write_text(tpl.format(desc=desc, mid=mid, root_hint=root.name), encoding="utf-8")
+    if ext not in TASK_EXTS:
+        p.chmod(0o755)
+    print(p.relative_to(root))
+
+
+def _fmt_line(m: Migration, done: dict | None):
+    tag = c(CYAN, "task  ") if m.is_task else c(DIM, "script")
+    desc = m.description()
+    if done:
+        mark = c(GREEN, "done   ") if done["how"] == "ran" else c(GREEN, "marked ")
+        when = c(DIM, done["at"][:16].replace("T", " "))
+        return f"  {mark} {m.id}  {tag}  {m.name}  {c(DIM, '· ' + desc) if desc else ''}  {when}"
+    return f"  {c(YELLOW, 'pending')} {m.id}  {tag}  {c(BOLD, m.name)}  {c(DIM, '· ' + desc) if desc else ''}"
+
+
+def cmd_status(a):
+    root = need_root()
+    done = read_done(root)
+    ms = migrations(root)
+    pend = [m for m in ms if m.id not in done]
+    if a.json:
+        print(json.dumps({"root": str(root), "pending": [{"id": m.id, "name": m.name, "kind": m.kind,
+                                                          "file": str(m.path.relative_to(root)),
+                                                          "description": m.description()} for m in pend],
+                          "done": [{"id": m.id, "name": m.name, **done[m.id]} for m in ms if m.id in done]},
+                         indent=2, ensure_ascii=False))
+        return
+    print(c(BOLD, f"fila · {root}"))
+    if not ms:
+        print("  no migrations yet. `fila new <name>`")
+        return
+    for m in ms:
+        print(_fmt_line(m, done.get(m.id)))
+    orphans = sorted(set(done) - {m.id for m in ms})
+    if orphans:
+        print(c(DIM, f"  ({len(orphans)} id(s) in done without a file: {', '.join(orphans)})"))
+    print()
+    n_s = sum(1 for m in pend if not m.is_task)
+    n_t = len(pend) - n_s
+    if pend:
+        print(f"  {c(YELLOW, str(len(pend)))} pending ({n_s} script{'s' * (n_s != 1)}, {n_t} task{'s' * (n_t != 1)})"
+              f" · {len(ms) - len(pend)} done")
+    else:
+        print(f"  {c(GREEN, 'all done')} · {len(ms)} migration{'s' * (len(ms) != 1)}")
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _runner(m: Migration) -> list[str]:
+    if m.ext == "sh":
+        return ["bash", str(m.path)]
+    if m.ext == "py":
+        return [sys.executable, str(m.path)]
+    if os.access(m.path, os.X_OK):
+        return [str(m.path)]
+    sys.exit(f"{m.path.name}: don't know how to run .{m.ext} (make it executable with a shebang)")
+
+
+def cmd_run(a):
+    root = need_root()
+    lock = root / DIR / "run.lock"
+    if lock.exists():
+        try:
+            pid = int(lock.read_text().strip() or 0)
+        except ValueError:
+            pid = 0
+        if pid and _alive(pid):
+            sys.exit(f"another `fila run` is active (pid {pid}). Remove {lock} if that is wrong.")
+    todo = pending(root)
+    if a.ids:
+        wanted = {resolve(root, r).id for r in a.ids}
+        todo = [m for m in todo if m.id in wanted]
+    scripts = [m for m in todo if not m.is_task]
+    tasks = [m for m in todo if m.is_task]
+    if not scripts:
+        print("nothing to run." + (f" {len(tasks)} task(s) wait for a person/agent: `fila status`" if tasks else ""))
+        return 0
+    if a.dry_run:
+        for m in scripts:
+            print(f"would run {m.path.relative_to(root)}")
+        return 0
+    lock.write_text(str(os.getpid()))
+    (root / DIR / "logs").mkdir(exist_ok=True)
+    try:
+        for m in scripts:
+            log = root / DIR / "logs" / f"{m.id}.log"
+            print(c(BOLD, f"== {m.id} {m.name}") + c(DIM, f"  (log: {log.relative_to(root)})"), flush=True)
+            env = {**os.environ, "FILA_ID": m.id, "FILA_ROOT": str(root)}
+            t0 = time.time()
+            with log.open("w", encoding="utf-8") as fh:
+                fh.write(f"# {m.path.name} · started {dt.datetime.now().astimezone().isoformat(timespec='seconds')}\n")
+                fh.flush()
+                p = subprocess.Popen(_runner(m), cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                for chunk in iter(lambda: p.stdout.read1(4096), b""):
+                    sys.stdout.buffer.write(chunk); sys.stdout.flush()
+                    fh.write(chunk.decode("utf-8", "replace")); fh.flush()
+                rc = p.wait()
+            took = f"{time.time() - t0:.1f}s"
+            if rc != 0:
+                print(c(RED, f"!! {m.id} failed (exit {rc}) after {took}. Queue stopped; nothing after it ran."))
+                return rc
+            write_done(root, m.id, "ran", took)
+            print(c(GREEN, f"ok {m.id} in {took}"))
+    finally:
+        lock.unlink(missing_ok=True)
+    if tasks:
+        print(f"{len(tasks)} task(s) still wait for a person/agent: `fila status`")
+    return 0
+
+
+def cmd_done(a):
+    root = need_root()
+    done = read_done(root)
+    for r in a.ids:
+        m = resolve(root, r)
+        if m.id in done:
+            print(f"{m.id} already done")
+            continue
+        write_done(root, m.id, "marked")
+        print(f"marked {m.id} {m.name}")
+
+
+def cmd_undo(a):
+    root = need_root()
+    ids = {resolve(root, r).id for r in a.ids}
+    remove_done(root, ids)
+    for i in sorted(ids):
+        print(f"{i} is pending again")
+
+
+def cmd_log(a):
+    root = need_root()
+    m = resolve(root, a.id)
+    log = root / DIR / "logs" / f"{m.id}.log"
+    if not log.exists():
+        sys.exit(f"no log for {m.id} yet")
+    sys.stdout.write(log.read_text(encoding="utf-8", errors="replace"))
+
+
+def hook_text(root: Path) -> str | None:
+    pend = pending(root)
+    if not pend:
+        return None
+    lines = [f"fila: {len(pend)} pending migration(s) in {root}/{DIR}/migrations (oldest first)."]
+    for m in pend:
+        d = m.description()
+        lines.append(f"- {m.id} {m.name} [{m.kind}]{': ' + d if d else ''}")
+    s = sum(1 for m in pend if not m.is_task)
+    if s:
+        lines.append("Scripts: run `fila run` (long jobs: in the background) and report the result.")
+    if s < len(pend):
+        lines.append("Tasks (.md): read the file, do what it says, then `fila done <id>`.")
+    lines.append("Mention this queue to the user at the start of the session before starting new work.")
+    return "\n".join(lines)
+
+
+def cmd_hook(a):
+    root = find_root()
+    if root is None:
+        return 0
+    txt = hook_text(root)
+    if txt is None:
+        return 0
+    n = len(pending(root))
+    print(json.dumps({"systemMessage": f"fila: {n} pending · `fila status`",
+                      "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": txt}},
+                     ensure_ascii=False))
+    return 0
+
+
+def cmd_install_hook(a):
+    target = (Path.home() if a.glob else (find_root() or Path.cwd())) / ".claude" / "settings.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    cfg = json.loads(target.read_text(encoding="utf-8")) if target.exists() and target.read_text().strip() else {}
+    exe = shutil.which("fila") or str(Path(__file__).resolve())
+    cmd = f'"{exe}" hook'
+    starts = cfg.setdefault("hooks", {}).setdefault("SessionStart", [])
+    for grp in starts:
+        for h in grp.get("hooks", []):
+            if h.get("command", "").endswith(" hook") and "fila" in h.get("command", ""):
+                print(f"already installed in {target}")
+                return 0
+    starts.append({"hooks": [{"type": "command", "command": cmd, "timeout": 10}]})
+    target.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"SessionStart hook added to {target}\n  {cmd}")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fila", description="Rails-style migration queue for pending work.",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=f"fila {VERSION}")
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("init").set_defaults(f=cmd_init)
+    p = sub.add_parser("new"); p.add_argument("name"); p.add_argument("--md", action="store_true")
+    p.add_argument("--ext", default="sh"); p.add_argument("-d", "--description"); p.set_defaults(f=cmd_new)
+    p = sub.add_parser("status"); p.add_argument("--json", action="store_true"); p.set_defaults(f=cmd_status)
+    p = sub.add_parser("run"); p.add_argument("ids", nargs="*"); p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(f=cmd_run)
+    p = sub.add_parser("done"); p.add_argument("ids", nargs="+"); p.set_defaults(f=cmd_done)
+    p = sub.add_parser("undo"); p.add_argument("ids", nargs="+"); p.set_defaults(f=cmd_undo)
+    p = sub.add_parser("log"); p.add_argument("id"); p.set_defaults(f=cmd_log)
+    sub.add_parser("hook").set_defaults(f=cmd_hook)
+    p = sub.add_parser("install-hook"); p.add_argument("--global", dest="glob", action="store_true")
+    p.set_defaults(f=cmd_install_hook)
+    a = ap.parse_args(argv)
+    if not getattr(a, "f", None):
+        a = ap.parse_args(["status"]) if find_root() else ap.parse_args(["--help"])
+    return a.f(a) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
