@@ -1,6 +1,9 @@
 # fila
 
-**Migrations no estilo Rails pro seu trabalho pendente, conferidas toda vez que o Claude Code abre.**
+**Um Kafka de bolso pro Claude Code.**
+
+Migrations no estilo Rails pro seu trabalho pendente: script roda uma vez e o id vai pra um log que
+só cresce, tarefa espera o agente, e a fila aparece toda vez que uma sessão começa.
 
 🇺🇸 [Read in English](README.md)
 
@@ -19,6 +22,11 @@ ser feito; gravar o id dela é a prova de que foi feito.**
 - Um **hook de SessionStart** conta pro Claude Code o que ainda está pendente assim que a sessão
   abre, e o agente continua de onde você parou.
 
+Por que "Kafka de bolso": o consumidor do Kafka não pergunta "já processei isso?", ele lê o offset
+que gravou. A `fila` faz o mesmo com o `.fila/done`, um log que só cresce com os ids executados, que
+é exatamente o que a `schema_migrations` do Rails é. Sem broker, sem partição, sem cluster: um
+arquivo e um log em texto, do tamanho de uma pessoa e um agente.
+
 Um arquivo só, só biblioteca padrão do Python 3, sem serviço rodando, sem banco. A fila é texto
 puro: dá pra commitar, comparar e revisar.
 
@@ -34,12 +42,43 @@ na fila, e o Claude Code vê no começo da próxima sessão.
 
 ## Instalar
 
+### Como plugin do Claude Code (recomendado)
+
+Dentro do Claude Code (2.1.275 ou mais novo):
+
+```
+/plugin install fila --marketplace Salv4d/fila
+```
+
+Em versão mais antiga, dois passos: `/plugin marketplace add Salv4d/fila` e depois `/plugin install fila@fila`.
+
+Isso traz o hook de SessionStart, o comando `fila` no PATH do agente e três comandos de barra:
+
+| Comando | O que faz |
+|---|---|
+| `/fila:status` | Mostra a fila e sugere o próximo passo |
+| `/fila:new <o quê>` | Põe trabalho novo na fila: o Claude decide se é script ou tarefa e escreve o arquivo |
+| `/fila:run` | Roda os scripts pendentes (em segundo plano quando são longos) e conta o resultado |
+
+Funciona no terminal, no app desktop e na extensão do VS Code, porque eles leem as mesmas
+configurações no computador. Não funciona no chat do claude.ai nem em sessão na nuvem: lá não
+existe pasta local.
+
+### Como CLI avulsa
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Salv4d/fila/main/fila -o ~/.local/bin/fila
 chmod +x ~/.local/bin/fila
+fila install-hook --global   # dentro de um projeto: hook no ~/.claude/settings.json + projeto registrado
 ```
 
-Ou clone o repositório e ponha o `fila` em qualquer pasta do seu `PATH`.
+Use um dos dois jeitos, não os dois, senão o hook roda duas vezes.
+
+### Windows
+
+Funciona com Python 3.8+ (`python`, `python3` ou o lançador `py`) e o Git for Windows, que é
+também o que o Claude Code usa pra rodar hooks. Migration `.py` roda em qualquer lugar; `.sh`
+precisa do bash (Git Bash). O CI roda os testes em Linux, macOS e Windows.
 
 ## Começo rápido
 
@@ -127,6 +166,18 @@ Commite `.fila/migrations/` e `.fila/done`: é o histórico do que foi feito e q
   chamando `fila` de uma subpasta. Os scripts recebem `FILA_ID` e `FILA_ROOT` no ambiente.
 - **Concorrência**: um arquivo de trava impede dois `fila run` ao mesmo tempo.
 - **Formato do `.fila/done`**: uma linha por id, `id<TAB>ran|marked<TAB>data-iso<TAB>duração`.
+
+## Parecidos, e onde a fila é diferente
+
+| Projeto | O que é | Diferença |
+|---|---|---|
+| [Beads](https://github.com/steveyegge/beads) | Rastreador de issues no git que dá memória ao agente entre sessões | Rastreia issues (status, prioridade, dependência); não executa nada. A `fila` roda script uma vez e anota |
+| [Backlog.md](https://github.com/MrLesk/Backlog.md) | Quadro de tarefas em Markdown pra gente e pra agente | É um quadro, não uma fila ordenada que roda cada coisa uma vez |
+| [Taskmaster AI](https://github.com/eyaltoledano/claude-task-master) | Quebra um documento de requisitos em tarefas pro agente | Planejamento; a `fila` é o trabalho já decidido que ainda precisa acontecer |
+| [scriptup](https://github.com/mg98/scriptup), [TerraRatchet](https://github.com/triptease/terra-ratchet) | Executores de script que rodam uma vez, no estilo migration | A mesma ideia pros scripts, mas sem agente: sem tarefa, sem hook de sessão |
+
+Se você precisa de um rastreador de issues completo pro agente, use o Beads. Se precisa de "isso
+tem que acontecer, uma vez, nessa ordem, e o agente não pode esquecer", é a `fila`.
 
 ## Testes
 

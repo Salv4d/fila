@@ -15,6 +15,7 @@ CONFIG = tempfile.mkdtemp()      # registry of projects isolated from the real ~
 
 def run(cwd, *args, check=True, home=None):
     env = {**os.environ, "NO_COLOR": "1", "XDG_CONFIG_HOME": CONFIG}
+    env.pop("CLAUDE_PROJECT_DIR", None)
     if home:
         env["HOME"] = str(home)
     env.pop("FORCE_COLOR", None)
@@ -106,12 +107,13 @@ class FilaTest(unittest.TestCase):
             cfg = Path(home) / "cfg"
             env_home = Path(home)
             self.new_script("render", "true", "20260101000001")
+            fake = {**os.environ, "HOME": home, "USERPROFILE": home, "XDG_CONFIG_HOME": str(cfg)}
             r = subprocess.run([sys.executable, str(FILA), "install-hook", "--global"], cwd=self.d, text=True,
-                               capture_output=True, env={**os.environ, "HOME": home, "XDG_CONFIG_HOME": str(cfg)})
+                               capture_output=True, env=fake)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertTrue((env_home / ".claude" / "settings.json").exists())
             r = subprocess.run([sys.executable, str(FILA), "hook"], cwd=elsewhere, text=True, capture_output=True,
-                               env={**os.environ, "HOME": home, "XDG_CONFIG_HOME": str(cfg)})
+                               env=fake)
             ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
             self.assertIn("20260101000001 render", ctx)
             self.assertIn(str(self.d.resolve()), ctx)
@@ -124,9 +126,26 @@ class FilaTest(unittest.TestCase):
     def test_env_and_cwd(self):
         sub = self.d / "deep" / "inside"
         sub.mkdir(parents=True)
-        self.new_script("env", 'echo "$FILA_ID $(pwd)" > env.txt', "20260101000001")
+        (self.d / ".fila" / "migrations" / "20260101000001_env.py").write_text(
+            "# where am I\nimport os, pathlib\n"
+            "pathlib.Path('env.txt').write_text(os.environ['FILA_ID'] + ' ' + os.getcwd())\n")
         run(sub, "run")                            # finds .fila/ in a parent directory
-        self.assertEqual((self.d / "env.txt").read_text().strip(), f"20260101000001 {self.d.resolve()}")
+        fid, cwd = (self.d / "env.txt").read_text().split(" ", 1)
+        self.assertEqual(fid, "20260101000001")
+        self.assertEqual(Path(cwd).resolve(), self.d.resolve())
+
+    def test_stale_lock_is_ignored(self):
+        (self.d / ".fila" / "run.lock").write_text("999999")
+        self.new_script("ok", "true", "20260101000001")
+        run(self.d, "run")
+        self.assertEqual(self.status()["pending"], [])
+
+    def test_claude_project_dir_is_used(self):
+        self.new_script("render", "true", "20260101000001")
+        with tempfile.TemporaryDirectory() as elsewhere:
+            env = {**os.environ, "CLAUDE_PROJECT_DIR": str(self.d), "XDG_CONFIG_HOME": CONFIG}
+            r = subprocess.run([sys.executable, str(FILA), "hook"], cwd=elsewhere, text=True, capture_output=True, env=env)
+            self.assertIn("20260101000001 render", r.stdout)
 
 
 if __name__ == "__main__":

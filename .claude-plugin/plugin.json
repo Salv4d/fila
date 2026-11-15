@@ -1,0 +1,22 @@
+{
+  "name": "fila",
+  "version": "0.2.0",
+  "description": "A pocket Kafka for Claude Code: Rails-style migrations for pending work. Scripts run once and their ids are logged; tasks wait for the agent; the queue shows up when a session starts.",
+  "author": {
+    "name": "Salv4d",
+    "url": "https://github.com/Salv4d"
+  },
+  "homepage": "https://github.com/Salv4d/fila",
+  "repository": "https://github.com/Salv4d/fila",
+  "license": "MIT",
+  "keywords": [
+    "queue",
+    "migrations",
+    "hooks",
+    "sessionstart",
+    "tasks",
+    "kafka",
+    "rails"
+  ],
+  "icon": ".claude-plugin/icon.png"
+}
