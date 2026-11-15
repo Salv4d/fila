@@ -76,7 +76,8 @@ python3 scripts/render.py bruto.mkv --out final.mp4
 | `fila undo ID ...` | Devolve migrations pra fila (o "rollback"). |
 | `fila log ID` | Saída da última execução (`.fila/logs/<id>.log`). |
 | `fila hook` | O hook de SessionStart. Não imprime nada quando não há pendência. |
-| `fila install-hook [--global]` | Põe o hook no `.claude/settings.json` (ou no `~/.claude/settings.json`). |
+| `fila install-hook [--global]` | Põe o hook no `.claude/settings.json`. `--global`: no `~/.claude/settings.json`, e registra este projeto. |
+| `fila projects [--remove PASTA]` | Lista (ou tira) os projetos que o hook global acompanha. |
 
 Os ids aceitam um prefixo único ou o nome da migration.
 
@@ -100,6 +101,19 @@ lista no contexto do Claude, com a instrução: rodar os scripts, fazer as taref
 
 O hook só **lê** a fila. Nunca roda migration sozinho. Rodar é sempre um `fila run` explícito,
 seu ou do agente.
+
+## Um hook, vários projetos
+
+Se você abre o Claude Code na sua pasta pessoal (ou em qualquer lugar fora do projeto), o hook do
+projeto nunca dispara. Rode isto uma vez dentro de cada projeto:
+
+```bash
+fila install-hook --global
+```
+
+Ele põe o hook no `~/.claude/settings.json` e registra o projeto em `~/.config/fila/projects`. Daí
+em diante, toda sessão, de onde quer que comece, recebe o trabalho pendente de todos os projetos
+registrados. `fila projects` mostra a lista.
 
 ## O que vai pro git
 

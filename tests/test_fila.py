@@ -10,8 +10,13 @@ from pathlib import Path
 FILA = Path(__file__).resolve().parent.parent / "fila"
 
 
-def run(cwd, *args, check=True):
-    env = {**os.environ, "NO_COLOR": "1"}
+CONFIG = tempfile.mkdtemp()      # registry of projects isolated from the real ~/.config
+
+
+def run(cwd, *args, check=True, home=None):
+    env = {**os.environ, "NO_COLOR": "1", "XDG_CONFIG_HOME": CONFIG}
+    if home:
+        env["HOME"] = str(home)
     env.pop("FORCE_COLOR", None)
     env.pop("FILA_ROOT", None)
     r = subprocess.run([sys.executable, str(FILA), *args], cwd=cwd, capture_output=True, text=True, env=env)
@@ -95,6 +100,21 @@ class FilaTest(unittest.TestCase):
         cfg = json.loads(s.read_text())
         self.assertEqual(cfg["permissions"]["allow"], ["Bash(ls)"])
         self.assertEqual(len(cfg["hooks"]["SessionStart"]), 1)
+
+    def test_global_hook_reports_registered_projects_from_anywhere(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as elsewhere:
+            cfg = Path(home) / "cfg"
+            env_home = Path(home)
+            self.new_script("render", "true", "20260101000001")
+            r = subprocess.run([sys.executable, str(FILA), "install-hook", "--global"], cwd=self.d, text=True,
+                               capture_output=True, env={**os.environ, "HOME": home, "XDG_CONFIG_HOME": str(cfg)})
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue((env_home / ".claude" / "settings.json").exists())
+            r = subprocess.run([sys.executable, str(FILA), "hook"], cwd=elsewhere, text=True, capture_output=True,
+                               env={**os.environ, "HOME": home, "XDG_CONFIG_HOME": str(cfg)})
+            ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+            self.assertIn("20260101000001 render", ctx)
+            self.assertIn(str(self.d.resolve()), ctx)
 
     def test_log_is_written(self):
         self.new_script("talk", "echo hello-from-migration", "20260101000001")
