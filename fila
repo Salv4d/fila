@@ -199,7 +199,7 @@ def cmd_new(a):
     p.write_text(tpl.format(desc=desc, mid=mid, root_hint=root.name), encoding="utf-8")
     if ext not in TASK_EXTS:
         p.chmod(0o755)
-    print(p.relative_to(root))
+    print(p.relative_to(root).as_posix())
 
 
 def _fmt_line(m: Migration, done: dict | None):
@@ -219,7 +219,7 @@ def cmd_status(a):
     pend = [m for m in ms if m.id not in done]
     if a.json:
         print(json.dumps({"root": str(root), "pending": [{"id": m.id, "name": m.name, "kind": m.kind,
-                                                          "file": str(m.path.relative_to(root)),
+                                                          "file": m.path.relative_to(root).as_posix(),
                                                           "description": m.description()} for m in pend],
                           "done": [{"id": m.id, "name": m.name, **done[m.id]} for m in ms if m.id in done]},
                          indent=2, ensure_ascii=False))
@@ -301,14 +301,14 @@ def cmd_run(a):
         return 0
     if a.dry_run:
         for m in scripts:
-            print(f"would run {m.path.relative_to(root)}")
+            print(f"would run {m.path.relative_to(root).as_posix()}")
         return 0
     lock.write_text(str(os.getpid()))
     (root / DIR / "logs").mkdir(exist_ok=True)
     try:
         for m in scripts:
             log = root / DIR / "logs" / f"{m.id}.log"
-            print(c(BOLD, f"== {m.id} {m.name}") + c(DIM, f"  (log: {log.relative_to(root)})"), flush=True)
+            print(c(BOLD, f"== {m.id} {m.name}") + c(DIM, f"  (log: {log.relative_to(root).as_posix()})"), flush=True)
             env = {**os.environ, "FILA_ID": m.id, "FILA_ROOT": str(root)}
             t0 = time.time()
             with log.open("w", encoding="utf-8") as fh:
